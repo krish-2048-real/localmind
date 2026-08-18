@@ -143,6 +143,8 @@ def test_session_title_trimming_emoji():
     assert "\ufffd" not in sess["title"]
 
     # Test case 2: normal ASCII message -> title is trimmed and has "..." (no regression)
+    with db.get_db() as conn:
+        conn.execute("DELETE FROM dedupe_cache")
     r2 = client.post("/api/sessions/", json={"title": "New Chat"})
     sid2 = r2.json()["id"]
     msg2 = "This is a very long ASCII message that will definitely exceed the limit of forty characters."
@@ -151,6 +153,8 @@ def test_session_title_trimming_emoji():
     assert sess2["title"] == "This is a very long ASCII message that w..."
 
     # Test case 3: message shorter than limit -> title unchanged
+    with db.get_db() as conn:
+        conn.execute("DELETE FROM dedupe_cache")
     r3 = client.post("/api/sessions/", json={"title": "New Chat"})
     sid3 = r3.json()["id"]
     msg3 = "Short message"
@@ -227,6 +231,28 @@ def test_upload_too_large(monkeypatch):
     files = {"file": ("big.txt", b"x" * 10, "text/plain")}
     r = client.post("/api/upload/", files=files, data={"session_id": "s1"})
     assert r.status_code == 413
+
+
+def test_upload_preview_endpoint(tmp_path, monkeypatch):
+    import routes.upload as up
+    monkeypatch.setattr(up, "UPLOAD_DIR", tmp_path)
+    
+    session_id = "test_preview_session"
+    filename = "doc.txt"
+    file_path = tmp_path / f"{session_id}_{filename}"
+    file_path.write_text("Hello this is a preview document file content.")
+    
+    r = client.get(f"/api/upload/preview?filename={filename}&session_id={session_id}")
+    assert r.status_code == 200
+    assert r.json() == {"content": "Hello this is a preview document file content."}
+
+
+def test_upload_preview_not_found(tmp_path, monkeypatch):
+    import routes.upload as up
+    monkeypatch.setattr(up, "UPLOAD_DIR", tmp_path)
+    
+    r = client.get("/api/upload/preview?filename=nonexistent.txt&session_id=s1")
+    assert r.status_code == 404
 
 
 def test_upload_emits_structured_logs(caplog):
@@ -334,15 +360,29 @@ def test_save_settings(caplog):
                 "temperature": 0.5,
                 "max_history_turns": 8,
                 "rag_top_k": 3,
+                "rag_chunk_size": 800,
+                "rag_chunk_overlap": 50,
                 "theme": "dark",
             },
         )
 
     assert r.json()["default_model"] == "mistral"
+    assert r.json()["rag_chunk_size"] == 800
     assert any(
         "Model switched from" in record.getMessage()
         for record in caplog.records
     )
+
+
+def test_rag_chunk_size_validation():
+    r = client.put(
+        "/api/settings/",
+        json={
+            "rag_chunk_size": 50,  # Below minimum threshold of 100
+        },
+    )
+    assert r.status_code == 422
+    assert "rag_chunk_size" in str(r.json())
 
 
 # ─── Models (mocked) ─────────────────────────────────────

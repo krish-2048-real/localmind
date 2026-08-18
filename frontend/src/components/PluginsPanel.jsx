@@ -11,16 +11,76 @@ const PLUGIN_ICONS = {
   jsonformat: BracesIcon,
 };
 
+// Helper badge renderer for compatibility tags (#597)
+function CompatibilityBadge({ compatibility }) {
+  if (!compatibility) return null;
+
+  // Normalize array vs object/string format
+  const badges = Array.isArray(compatibility)
+    ? compatibility
+    : typeof compatibility === "object"
+    ? Object.values(compatibility)
+    : [compatibility];
+
+  return (
+    <div className="inline-flex items-center gap-1 flex-wrap">
+      {badges.map((badge, idx) => {
+        const isLocal = String(badge).toLowerCase().includes("local") || String(badge).toLowerCase().includes("v1");
+        const badgeStyle = isLocal
+          ? "bg-emerald-950/60 text-emerald-400 border-emerald-800/60"
+          : "bg-blue-950/60 text-blue-400 border-blue-800/60";
+
+        return (
+          <span
+            key={idx}
+            data-testid="compatibility-badge"
+            className={`text-[10px] font-mono px-1.5 py-0.5 rounded border ${badgeStyle}`}
+          >
+            {badge}
+          </span>
+        );
+      })}
+    </div>
+  );
+}
+
 export default function PluginsPanel({ sessionId, onClose }) {
   const [plugins, setPlugins] = useState([]);
+  const [searchQuery, setSearchQuery] = useState("");
   const [selected, setSelected] = useState(null);
-  const [input, setInput] = useState("");
+
+  // Persistent input state initialized from localStorage (#596)
+  const [input, setInput] = useState(() => {
+    if (!sessionId) return "";
+    return localStorage.getItem(`localmind_plugin_draft_${sessionId}`) || "";
+  });
+
   const [output, setOutput] = useState("");
   const [running, setRunning] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [copied, setCopied] = useState(false);
   const [logs, setLogs] = useState([]);
+
+  // Drag-and-Drop state (#604)
+  const [draggedIndex, setDraggedIndex] = useState(null);
+
+  // Persistent Pinned / Favorite Plugin IDs (#601)
+  const [pinnedIds, setPinnedIds] = useState(() => {
+    try {
+      const saved = localStorage.getItem(`plugins-panel-pinned:${sessionId}`);
+      return saved ? JSON.parse(saved) : [];
+    } catch (e) {
+      return [];
+    }
+  });
+
+  // State for contextual menu and action toast feedback (#602, #605)
+  const [activeMenuId, setActiveMenuId] = useState(null);
+  const [notification, setNotification] = useState("");
+
+  // Changelog modal state (#603)
+  const [changelogPlugin, setChangelogPlugin] = useState(null);
 
   // Persistence: View collapsed state (#592)
   const [isCollapsed, setIsCollapsed] = useState(() => {
@@ -40,6 +100,15 @@ export default function PluginsPanel({ sessionId, onClose }) {
       return null;
     }
   });
+
+  // Sync pinned plugin state to localStorage (#601)
+  useEffect(() => {
+    try {
+      localStorage.setItem(`plugins-panel-pinned:${sessionId}`, JSON.stringify(pinnedIds));
+    } catch (e) {
+      console.warn("localStorage write blocked:", e);
+    }
+  }, [pinnedIds, sessionId]);
 
   // Sync collapsed state to localStorage (#592)
   useEffect(() => {
@@ -72,13 +141,31 @@ export default function PluginsPanel({ sessionId, onClose }) {
     }
   };
 
-  // Fetch plugins & restore selected plugin object if ID was saved (#592)
+  // Fetch plugins, apply saved custom drag order (#604), and restore selected plugin (#592)
   useEffect(() => {
     setLoading(true);
     setError("");
     getPlugins()
       .then((d) => {
-        const fetchedPlugins = d.plugins || [];
+        let fetchedPlugins = d.plugins || [];
+
+        // Apply saved custom drag ordering if available (#604)
+        try {
+          const savedOrder = localStorage.getItem(`plugins-panel-order:${sessionId}`);
+          if (savedOrder) {
+            const orderArray = JSON.parse(savedOrder);
+            fetchedPlugins.sort((a, b) => {
+              const indexA = orderArray.indexOf(a.id);
+              const indexB = orderArray.indexOf(b.id);
+              if (indexA === -1) return 1;
+              if (indexB === -1) return -1;
+              return indexA - indexB;
+            });
+          }
+        } catch (e) {
+          console.warn("Failed to load plugin order from localStorage", e);
+        }
+
         setPlugins(fetchedPlugins);
 
         if (selectedPluginId) {
@@ -92,7 +179,45 @@ export default function PluginsPanel({ sessionId, onClose }) {
       .finally(() => setLoading(false));
 
     fetchLogs();
-  }, [selectedPluginId]);
+  }, [selectedPluginId, sessionId]);
+
+  // Helper to persist order array to localStorage (#604)
+  const savePluginOrder = (orderedList) => {
+    try {
+      const orderIds = orderedList.map((p) => p.id);
+      localStorage.setItem(`plugins-panel-order:${sessionId}`, JSON.stringify(orderIds));
+    } catch (e) {
+      console.warn("Failed to save plugin order", e);
+    }
+  };
+
+  // Drag-and-Drop Event Handlers (#604)
+  const handleDragStart = (e, index) => {
+    setDraggedIndex(index);
+    if (e.dataTransfer) {
+      e.dataTransfer.effectAllowed = "move";
+    }
+  };
+
+  const handleDragOver = (e, index) => {
+    e.preventDefault();
+    if (e.dataTransfer) {
+      e.dataTransfer.dropEffect = "move";
+    }
+  };
+
+  const handleDrop = (e, targetIndex) => {
+    e.preventDefault();
+    if (draggedIndex === null || draggedIndex === targetIndex) return;
+
+    const reordered = [...plugins];
+    const [draggedItem] = reordered.splice(draggedIndex, 1);
+    reordered.splice(targetIndex, 0, draggedItem);
+
+    setPlugins(reordered);
+    setDraggedIndex(null);
+    savePluginOrder(reordered);
+  };
 
   function handleSelectPlugin(plugin) {
     setSelected(plugin);
@@ -101,6 +226,99 @@ export default function PluginsPanel({ sessionId, onClose }) {
     setError("");
     setCopied(false);
   }
+
+  function togglePin(e, pluginId) {
+    e.stopPropagation();
+    setPinnedIds((prev) =>
+      prev.includes(pluginId) ? prev.filter((id) => id !== pluginId) : [...prev, pluginId]
+    );
+  }
+
+  // Re-sync input draft whenever sessionId changes (#596)
+  useEffect(() => {
+    if (!sessionId) return;
+    setInput(localStorage.getItem(`localmind_plugin_draft_${sessionId}`) || "");
+  }, [sessionId]);
+
+  // Persist plugin draft input to localStorage on edit (#596)
+  useEffect(() => {
+    if (!sessionId) return;
+    if (input) {
+      localStorage.setItem(`localmind_plugin_draft_${sessionId}`, input);
+    } else {
+      localStorage.removeItem(`localmind_plugin_draft_${sessionId}`);
+    }
+  }, [input, sessionId]);
+
+  // Close menus and modals on outside click or Escape key (#603, #605)
+  useEffect(() => {
+    const handleGlobalClick = () => setActiveMenuId(null);
+    const handleKeyDown = (e) => {
+      if (e.key === "Escape") {
+        setActiveMenuId(null);
+        setChangelogPlugin(null);
+      }
+    };
+    window.addEventListener("click", handleGlobalClick);
+    window.addEventListener("keydown", handleKeyDown);
+    return () => {
+      window.removeEventListener("click", handleGlobalClick);
+      window.removeEventListener("keydown", handleKeyDown);
+    };
+  }, []);
+
+  const showNotification = (msg) => {
+    setNotification(msg);
+    setTimeout(() => setNotification(""), 3000);
+  };
+
+  // Export Action (#605)
+  const handleExportPlugin = (e, plugin) => {
+    e.stopPropagation();
+    setActiveMenuId(null);
+    try {
+      const dataStr = "data:text/json;charset=utf-8," + encodeURIComponent(JSON.stringify(plugin, null, 2));
+      const downloadAnchor = document.createElement("a");
+      downloadAnchor.setAttribute("href", dataStr);
+      downloadAnchor.setAttribute("download", `${plugin.id}-config.json`);
+      document.body.appendChild(downloadAnchor);
+      downloadAnchor.click();
+      downloadAnchor.remove();
+      showNotification(`Exported ${plugin.name} configuration.`);
+    } catch (err) {
+      console.error("Export failed", err);
+      setError("Failed to export plugin config.");
+    }
+  };
+
+  // Share Action (#605)
+  const handleSharePlugin = async (e, plugin) => {
+    e.stopPropagation();
+    setActiveMenuId(null);
+    const shareUrl = `${window.location.origin}${window.location.pathname}?plugin=${plugin.id}`;
+    try {
+      if (navigator.clipboard) {
+        await navigator.clipboard.writeText(shareUrl);
+        showNotification(`Copied share link for ${plugin.name}!`);
+      } else {
+        showNotification(`Share link: ${shareUrl}`);
+      }
+    } catch (err) {
+      console.error("Share failed", err);
+      showNotification(`Share link: ${shareUrl}`);
+    }
+  };
+
+  function handleOpenChangelog(e, plugin) {
+    e.stopPropagation();
+    setChangelogPlugin(plugin);
+    setActiveMenuId(null);
+  }
+
+  const toggleContextMenu = (e, pluginId) => {
+    e.stopPropagation();
+    setActiveMenuId((prev) => (prev === pluginId ? null : pluginId));
+  };
 
   async function run() {
     if (!selected || !input.trim() || running) return;
@@ -113,6 +331,10 @@ export default function PluginsPanel({ sessionId, onClose }) {
       if (r.success) {
         setOutput(r.output);
         await fetchLogs();
+        // Clear saved draft from localStorage after successful execution (#596)
+        if (sessionId) {
+          localStorage.removeItem(`localmind_plugin_draft_${sessionId}`);
+        }
       } else {
         setError(r.error || "Plugin failed");
       }
@@ -122,6 +344,24 @@ export default function PluginsPanel({ sessionId, onClose }) {
       setRunning(false);
     }
   }
+
+  // Sort plugins with pinned/favorites at the top (#601)
+  const sortedPlugins = [...plugins].sort((a, b) => {
+    const isAPinned = pinnedIds.includes(a.id);
+    const isBPinned = pinnedIds.includes(b.id);
+    if (isAPinned && !isBPinned) return -1;
+    if (!isAPinned && isBPinned) return 1;
+    return 0;
+  });
+
+  // Filter plugins in real-time by search query (#600)
+  const filteredPlugins = sortedPlugins.filter((p) => {
+    if (!searchQuery.trim()) return true;
+    const q = searchQuery.toLowerCase();
+    const nameMatch = p.name?.toLowerCase().includes(q);
+    const descMatch = p.description?.toLowerCase().includes(q);
+    return nameMatch || descMatch;
+  });
 
   const handleCopy = async () => {
     if (!output) return;
@@ -135,7 +375,7 @@ export default function PluginsPanel({ sessionId, onClose }) {
   };
 
   return (
-    <div className="border-b border-gray-800 bg-gray-900 px-5 py-4 shrink-0" data-testid="plugins-panel">
+    <div className="border-b border-gray-800 bg-gray-900 px-5 py-4 shrink-0 relative" data-testid="plugins-panel">
       <div className="flex items-center justify-between mb-3">
         <div className="flex items-center gap-1.5">
           {/* Collapse/Expand toggle button */}
@@ -153,7 +393,7 @@ export default function PluginsPanel({ sessionId, onClose }) {
             Plugins Workspace
           </p>
 
-          {/* FIXED (#593): Pure CSS/Tailwind interactive help tooltip utility box */}
+          {/* Interactive help tooltip utility box (#593) */}
           <div className="group relative inline-block">
             <button
               type="button"
@@ -164,14 +404,16 @@ export default function PluginsPanel({ sessionId, onClose }) {
             </button>
             <div className="absolute left-1/2 -translate-x-1/2 bottom-full mb-2 hidden group-hover:block group-focus-within:block w-52 bg-gray-950 border border-gray-800 text-gray-400 text-[10px] p-2 rounded shadow-xl z-50 pointer-events-none leading-relaxed">
               <span className="font-semibold text-white block mb-0.5">Plugins Workspace Help:</span>
-              Select an active plugin tool to run utility scripts or perform automated text/data transformations on your workspace inputs.
+              Select an active plugin tool to run utility scripts or perform automated text/data transformations on your workspace inputs. Drag plugins to reorder.
               <div className="absolute top-full left-1/2 -translate-x-1/2 border-4 border-transparent border-t-gray-950"></div>
             </div>
           </div>
         </div>
 
         <button
+          type="button"
           onClick={onClose}
+          data-testid="close-panel-btn"
           className="text-gray-500 hover:text-gray-300 text-2xl md:text-lg leading-none p-1"
           aria-label="Close panel"
         >
@@ -179,15 +421,27 @@ export default function PluginsPanel({ sessionId, onClose }) {
         </button>
       </div>
 
+      {/* Action Notification Banner (#605) */}
+      {notification && (
+        <div data-testid="action-notification" className="mb-3 text-xs bg-purple-950/60 border border-purple-800 text-purple-300 p-2 rounded-lg flex items-center justify-between shadow-sm">
+          <span>{notification}</span>
+          <button onClick={() => setNotification("")} className="text-purple-400 hover:text-white font-bold ml-2">×</button>
+        </div>
+      )}
+
       {/* Global Inline Error Banner (#588) */}
       {error && (
-        <div className="mb-3 text-xs bg-red-950/40 border border-red-900/50 text-red-400 p-2.5 rounded-xl flex items-start gap-2 shadow-sm transition-all duration-200">
+        <div
+          data-testid="plugin-error-message"
+          className="mb-3 text-xs bg-red-950/40 border border-red-900/50 text-red-400 p-2.5 rounded-xl flex items-start gap-2 shadow-sm transition-all duration-200"
+        >
           <ErrorIcon className="w-4 h-4 mt-0.5 shrink-0 text-red-400" />
           <div className="flex-1">
             <span className="font-semibold block mb-0.5">Plugin Error</span>
             <p className="text-red-300/90 leading-relaxed">{error}</p>
           </div>
           <button
+            type="button"
             onClick={() => setError("")}
             className="text-red-500 hover:text-red-300 transition font-bold text-sm leading-none px-1"
             title="Dismiss error"
@@ -197,36 +451,119 @@ export default function PluginsPanel({ sessionId, onClose }) {
         </div>
       )}
 
-      {/* Collapsible Panel Section (#592) */}
+      {/* Collapsible Panel Section */}
       {!isCollapsed && (
         <>
-          {/* Plugin selector row */}
-          <div className="flex flex-wrap gap-2 mb-4 md:mb-3 shrink-0">
-            {plugins.map((p) => (
-              <button
-                key={p.id}
-                onClick={() => handleSelectPlugin(p)}
-                className={`text-xs px-3.5 py-2 md:py-1.5 rounded-lg border transition font-medium touch-manipulation
-                  ${selected?.id === p.id ? "border-purple-500 bg-purple-900/30 text-purple-300 shadow-sm shadow-purple-500/10" : "border-gray-700 text-gray-400 hover:bg-gray-800"}`}
-              >
-                {(() => {
-                  const Icon = PLUGIN_ICONS[p.icon] || PlugIcon;
-                  return (
-                    <span className="inline-flex items-center gap-1">
-                      <Icon className="w-3.5 h-3.5" />
-                      <span>{p.name}</span>
-                    </span>
-                  );
-                })()}
-              </button>
-            ))}
+          {/* Search Refinement Input (#600) */}
+          <div className="mb-3">
+            <input
+              type="text"
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+              placeholder="Search plugins..."
+              aria-label="Filter plugins"
+              className="w-full text-xs bg-gray-800 border border-gray-700 rounded-lg px-3 py-1.5 text-gray-200 placeholder-gray-600 outline-none focus:border-purple-500 font-sans"
+            />
+          </div>
+
+          {/* Plugin selector with favorite & pin toggles (#601), compatibility badges (#597), & contextual menus (#602, #603, #605) */}
+          <div data-testid="plugin-selector-list" className="flex flex-wrap gap-2 mb-4 md:mb-3 shrink-0 min-h-[32px]">
+            {filteredPlugins.length > 0 ? (
+              filteredPlugins.map((p, index) => {
+                const isPinned = pinnedIds.includes(p.id);
+                const Icon = PLUGIN_ICONS[p.icon] || PlugIcon;
+                const isMenuOpen = activeMenuId === p.id;
+                const isBeingDragged = draggedIndex === index;
+
+                return (
+                  <div
+                    key={p.id}
+                    draggable
+                    onDragStart={(e) => handleDragStart(e, index)}
+                    onDragOver={(e) => handleDragOver(e, index)}
+                    onDrop={(e) => handleDrop(e, index)}
+                    onClick={() => handleSelectPlugin(p)}
+                    data-testid={`plugin-btn-${p.id}`}
+                    className={`relative text-xs px-3.5 py-2 md:py-1.5 rounded-lg border transition font-medium flex items-center gap-1.5 cursor-grab active:cursor-grabbing touch-manipulation select-none
+                      ${isBeingDragged ? "opacity-40 border-dashed border-purple-400" : ""}
+                      ${selected?.id === p.id ? "border-purple-500 bg-purple-900/30 text-purple-300 shadow-sm shadow-purple-500/10" : "border-gray-700 text-gray-400 hover:bg-gray-800"}`}
+                  >
+                    <Icon className="w-3.5 h-3.5" />
+                    <span>{p.name}</span>
+
+                    {p.compatibility && <CompatibilityBadge compatibility={p.compatibility} />}
+
+                    {/* Pin/Favorite Toggle Button (#601) */}
+                    <button
+                      type="button"
+                      onClick={(e) => togglePin(e, p.id)}
+                      aria-label={isPinned ? `Unpin ${p.name}` : `Pin ${p.name}`}
+                      className={`ml-1 hover:text-amber-300 transition ${isPinned ? "text-amber-400" : "text-gray-600"}`}
+                    >
+                      {isPinned ? "★" : "☆"}
+                    </button>
+
+                    {/* Context Menu Trigger Button (#602) */}
+                    <button
+                      type="button"
+                      onClick={(e) => toggleContextMenu(e, p.id)}
+                      aria-label={`Options for ${p.name}`}
+                      className="ml-0.5 text-gray-500 hover:text-gray-200 transition px-1 rounded hover:bg-gray-700/50 font-bold"
+                    >
+                      ⋮
+                    </button>
+
+                    {/* Context Dropdown Menu (#602, #603, #605) */}
+                    {isMenuOpen && (
+                      <div
+                        onClick={(e) => e.stopPropagation()}
+                        className="absolute left-0 top-full mt-1 w-36 bg-gray-950 border border-gray-800 rounded-lg shadow-xl z-50 py-1 text-xs text-gray-300 font-normal"
+                      >
+                        <button
+                          type="button"
+                          onClick={(e) => handleSharePlugin(e, p)}
+                          className="w-full text-left px-3 py-1.5 hover:bg-gray-800 hover:text-white"
+                        >
+                          Share Plugin
+                        </button>
+                        <button
+                          type="button"
+                          onClick={(e) => handleExportPlugin(e, p)}
+                          className="w-full text-left px-3 py-1.5 hover:bg-gray-800 hover:text-white"
+                        >
+                          Export Config
+                        </button>
+                        <button
+                          type="button"
+                          onClick={(e) => handleOpenChangelog(e, p)}
+                          className="w-full text-left px-3 py-1.5 hover:bg-gray-800 hover:text-white"
+                        >
+                          View Changelog
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                );
+              })
+            ) : (
+              <p className="text-xs text-gray-500 italic py-1">No matching plugins found.</p>
+            )}
           </div>
 
           {/* Plugin Input/Output Area OR Empty-State Guidance */}
           {selected ? (
-            <div className="space-y-3 md:space-y-2 flex-1 md:flex-initial flex flex-col justify-start shrink-0">
-              <p className="text-xs text-gray-500">{selected.description}</p>
+            <div data-testid="plugin-workspace" className="space-y-3 md:space-y-2 flex-1 md:flex-initial flex flex-col justify-start shrink-0">
+              <div className="flex items-center justify-between gap-2">
+                <p className="text-xs text-gray-500">{selected.description}</p>
+                {selected.compatibility && (
+                  <div className="shrink-0 flex items-center gap-1 text-[11px] text-gray-400">
+                    <span className="text-gray-500">Compatibility:</span>
+                    <CompatibilityBadge compatibility={selected.compatibility} />
+                  </div>
+                )}
+              </div>
               <textarea
+                data-testid="plugin-input-textarea"
                 value={input}
                 onChange={(e) => setInput(e.target.value)}
                 placeholder={`Enter input for ${selected.name}...`}
@@ -235,6 +572,8 @@ export default function PluginsPanel({ sessionId, onClose }) {
               />
               <div className="flex items-center justify-between">
                 <button
+                  type="button"
+                  data-testid="run-plugin-btn"
                   onClick={run}
                   disabled={!input.trim() || running}
                   className="w-full md:w-auto text-sm md:text-xs bg-purple-700 hover:bg-purple-600 disabled:opacity-40 text-white px-5 py-2.5 md:py-1.5 rounded-lg transition font-medium shadow-md"
@@ -243,7 +582,7 @@ export default function PluginsPanel({ sessionId, onClose }) {
                 </button>
               </div>
 
-              {/* Output block with copy feedback button (#594) */}
+              {/* Output block with copy feedback button */}
               {output && (
                 <div className="relative mt-2">
                   <div className="flex items-center justify-between bg-gray-800 border border-gray-700 rounded-t-xl px-3 py-1.5 text-xs text-gray-400">
@@ -256,14 +595,14 @@ export default function PluginsPanel({ sessionId, onClose }) {
                       {copied ? "Copied!" : "Copy"}
                     </button>
                   </div>
-                  <pre className="text-xs bg-gray-800 border border-t-0 border-gray-700 rounded-b-xl px-3 py-2 text-green-300 whitespace-pre-wrap max-h-40 overflow-y-auto font-mono">
+                  <pre className="text-xs bg-gray-800 border border-t-0 border-gray-700 rounded-b-xl px-3 py-2 text-green-300 whitespace-pre-wrap max-h-40 overflow-y-auto font-mono" data-testid="plugin-output-display">
                     {output}
                   </pre>
                 </div>
               )}
             </div>
           ) : (
-            /* Empty State Guidance Card (#587) */
+            /* Empty State Guidance Card */
             <div className="flex-1 md:flex-initial flex flex-col items-center justify-center text-center p-6 my-2 border border-dashed border-gray-800 rounded-xl bg-gray-900/40">
               <PlugIcon className="w-8 h-8 text-gray-600 mb-2 animate-pulse" />
               <p className="text-xs font-medium text-gray-300">No Plugin Selected</p>
@@ -308,6 +647,55 @@ export default function PluginsPanel({ sessionId, onClose }) {
             )}
           </div>
         </>
+      )}
+
+      {/* Changelog Modal (#603) */}
+      {changelogPlugin && (
+        <div
+          className="fixed inset-0 bg-black/60 backdrop-blur-xs flex items-center justify-center p-4 z-50"
+          onClick={() => setChangelogPlugin(null)}
+          data-testid="changelog-modal"
+        >
+          <div
+            className="bg-gray-900 border border-gray-800 rounded-xl p-5 max-w-md w-full shadow-2xl space-y-4"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-center justify-between border-b border-gray-800 pb-3">
+              <h3 className="text-sm font-semibold text-white flex items-center gap-2">
+                <span>{changelogPlugin.name}</span>
+                <span className="text-xs font-mono text-purple-400 bg-purple-950/60 border border-purple-800/50 px-2 py-0.5 rounded-full">
+                  Changelog
+                </span>
+              </h3>
+              <button
+                type="button"
+                onClick={() => setChangelogPlugin(null)}
+                className="text-gray-500 hover:text-white transition font-bold text-lg leading-none p-1"
+                aria-label="Close changelog modal"
+              >
+                ×
+              </button>
+            </div>
+
+            <div className="space-y-3 max-h-60 overflow-y-auto pr-1">
+              {changelogPlugin.changelog && changelogPlugin.changelog.length > 0 ? (
+                changelogPlugin.changelog.map((item, idx) => (
+                  <div key={idx} className="bg-gray-800/40 border border-gray-800 p-3 rounded-lg space-y-1">
+                    <div className="flex items-center justify-between text-xs font-mono">
+                      <span className="text-purple-300 font-semibold">{item.version}</span>
+                      <span className="text-gray-500 text-[11px]">{item.date}</span>
+                    </div>
+                    <p className="text-xs text-gray-300 leading-relaxed">{item.changes}</p>
+                  </div>
+                ))
+              ) : (
+                <p className="text-xs text-gray-500 italic text-center py-4">
+                  No changelog preview available for {changelogPlugin.name}.
+                </p>
+              )}
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );
